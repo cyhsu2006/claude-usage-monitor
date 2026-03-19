@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import sys
 import threading
+import urllib.request
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -42,6 +43,21 @@ FIREFOX_PROFILES = [
     os.path.expanduser("~/.mozilla/firefox"),
 ]
 REFRESH_INTERVAL = 300  # seconds (5 minutes)
+STATUS_REFRESH_INTERVAL = 120  # seconds (2 minutes)
+STATUS_API_URL = "https://status.claude.com/api/v2/status.json"
+
+STATUS_COLORS = {
+    "none":     "#52c05a",   # 綠
+    "minor":    "#d4c022",   # 黃
+    "major":    "#e08c32",   # 橘
+    "critical": "#e05252",   # 紅
+}
+STATUS_LABELS = {
+    "none":     "正常",
+    "minor":    "輕微異常",
+    "major":    "重大異常",
+    "critical": "嚴重中斷",
+}
 
 
 # ─── Cookie Management ────────────────────────────────────────────────────────
@@ -264,6 +280,24 @@ class UsageWorker(QObject):
             self.error.emit(str(e))
 
 
+class StatusWorker(QObject):
+    """背景查詢 Claude 服務狀態。"""
+    finished = pyqtSignal(str, str)   # indicator, description
+    error = pyqtSignal()
+
+    def run(self):
+        try:
+            with urllib.request.urlopen(STATUS_API_URL, timeout=10) as resp:
+                data = json.loads(resp.read())
+            status = data.get("status", {})
+            self.finished.emit(
+                status.get("indicator", "none"),
+                status.get("description", ""),
+            )
+        except Exception:
+            self.error.emit()
+
+
 class UsageWidget(QWidget):
     """深色主題浮動使用量監控視窗。"""
 
@@ -278,8 +312,16 @@ class UsageWidget(QWidget):
         self._timer.timeout.connect(self._refresh)
         self._timer.start(REFRESH_INTERVAL * 1000)
 
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(self._refresh_status)
+        self._status_timer.start(STATUS_REFRESH_INTERVAL * 1000)
+
+        self._status_thread = None
+        self._status_worker = None
+
         self._setup_ui()
         self._refresh()
+        self._refresh_status()
 
     def _setup_ui(self):
         self.setWindowTitle("Claude Usage")
@@ -306,6 +348,19 @@ class UsageWidget(QWidget):
         self._account_label = QLabel("帳號：讀取中...")
         self._account_label.setStyleSheet("font-size: 12px; color: #6080a0;")
         hl.addWidget(self._account_label)
+
+        # 服務狀態燈號列
+        status_row = QHBoxLayout()
+        status_row.setSpacing(6)
+        self._status_dot = QLabel("●")
+        self._status_dot.setStyleSheet("font-size: 13px; color: #404060;")
+        status_row.addWidget(self._status_dot)
+        self._service_status_label = QLabel("服務狀態：查詢中...")
+        self._service_status_label.setStyleSheet("font-size: 12px; color: #6080a0;")
+        status_row.addWidget(self._service_status_label)
+        status_row.addStretch()
+        hl.addLayout(status_row)
+
         layout.addWidget(header)
 
         # 主內容
@@ -452,6 +507,32 @@ class UsageWidget(QWidget):
         self._worker.error.connect(self._thread.quit)
 
         self._thread.start()
+
+    def _refresh_status(self):
+        """查詢 Claude 服務狀態。"""
+        if self._status_thread and self._status_thread.isRunning():
+            return
+        self._status_thread = QThread()
+        self._status_worker = StatusWorker()
+        self._status_worker.moveToThread(self._status_thread)
+        self._status_thread.started.connect(self._status_worker.run)
+        self._status_worker.finished.connect(self._update_service_status)
+        self._status_worker.error.connect(self._on_status_error)
+        self._status_worker.finished.connect(self._status_thread.quit)
+        self._status_worker.error.connect(self._status_thread.quit)
+        self._status_thread.start()
+
+    def _update_service_status(self, indicator: str, description: str):
+        color = STATUS_COLORS.get(indicator, "#404060")
+        label = STATUS_LABELS.get(indicator, indicator)
+        self._status_dot.setStyleSheet(f"font-size: 13px; color: {color};")
+        self._service_status_label.setText(f"服務狀態：{label}")
+        self._service_status_label.setStyleSheet(f"font-size: 12px; color: {color};")
+
+    def _on_status_error(self):
+        self._status_dot.setStyleSheet("font-size: 13px; color: #404060;")
+        self._service_status_label.setText("服務狀態：無法查詢")
+        self._service_status_label.setStyleSheet("font-size: 12px; color: #505070;")
 
 
 # ─── System Tray ─────────────────────────────────────────────────────────────
